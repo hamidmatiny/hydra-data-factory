@@ -25,7 +25,7 @@ services:
       - ./logs:/app/logs
     restart: unless-stopped
 
-  etl-processor:
+  hydra-etl-processor:
     build:
       context: .
       dockerfile: Dockerfile

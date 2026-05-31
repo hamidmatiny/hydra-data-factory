@@ -45,6 +45,7 @@ RUN groupadd --system appuser \
 COPY --from=builder /install /usr/local
 COPY src/ ./src/
 COPY config/ ./config/
+COPY tests/ ./tests/
 
 RUN mkdir -p /data/telemetry /data/parquet /data/dead_letter /app/logs \
     && chown -R appuser:appuser /data /app /home/appuser
