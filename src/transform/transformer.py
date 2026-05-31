@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from pydantic import ValidationError
 
+from config.schema_contract import apply_data_contract_gate
 from src.simulator.schemas import VehicleTelemetry
 from src.utils.logger import get_logger
 
@@ -59,6 +60,7 @@ class TransformStats:
     input_records: int = 0
     valid_records: int = 0
     rejected_records: int = 0
+    contract_rejected_records: int = 0
     parquet_rows_written: int = 0
 
     @property
@@ -102,8 +104,11 @@ class TelemetryTransformer:
         self.ingest_and_triage()
 
         if self._valid_rows:
-            table = self.build_arrow_table()
-            self.write_partitioned_parquet(table, output_base_dir)
+            try:
+                table = self.build_arrow_table()
+                self.write_partitioned_parquet(table, output_base_dir)
+            except ValueError as exc:
+                logger.warning("Parquet write skipped after contract gate: %s", exc)
         else:
             logger.warning("No valid records found; skipping Parquet write.")
 
@@ -111,11 +116,12 @@ class TelemetryTransformer:
             self.persist_dead_letter_queue()
 
         logger.info(
-            "ETL run finished: files=%d records=%d valid=%d rejected=%d parquet_rows=%d",
+            "ETL run finished: files=%d records=%d valid=%d rejected=%d contract_rejected=%d parquet_rows=%d",
             self.stats.input_files,
             self.stats.input_records,
             self.stats.valid_records,
             self.stats.rejected_records,
+            self.stats.contract_rejected_records,
             self.stats.parquet_rows_written,
         )
         return self.stats
@@ -126,16 +132,18 @@ class TelemetryTransformer:
             raise FileNotFoundError(f"Input directory does not exist: {self._input_path}")
 
         json_files = sorted(self._input_path.glob(INPUT_GLOB))
-        self.stats.input_files = len(json_files)
+        self.ingest_files(json_files)
 
+    def ingest_files(self, json_files: list[Path]) -> None:
+        """Ingest and triage an explicit list of telemetry batch files."""
         if not json_files:
             logger.warning(
-                "No telemetry batch files matching %r in %s",
-                INPUT_GLOB,
+                "No telemetry batch files provided for ingestion in %s",
                 self._input_path.resolve(),
             )
             return
 
+        self.stats.input_files += len(json_files)
         logger.info("Discovered %d JSON batch file(s) for ingestion.", len(json_files))
 
         for file_path in json_files:
@@ -320,8 +328,8 @@ class TelemetryTransformer:
         """
         Convert validated rows into a strictly typed PyArrow Table via Pandas.
 
-        GPS coordinates are flattened to root-level ``latitude`` and
-        ``longitude`` columns; timestamps use microsecond UTC resolution.
+        Applies Pandera **Data Quality Gates** before casting; contract failures
+        are routed to the DLQ without aborting the pipeline.
         """
         if not self._valid_rows:
             raise ValueError("Cannot build Arrow table without valid records.")
@@ -329,8 +337,30 @@ class TelemetryTransformer:
         frame = pd.DataFrame(self._valid_rows)
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
 
-        table = pa.Table.from_pandas(frame, schema=TELEMETRY_ARROW_SCHEMA, preserve_index=False)
-        logger.info("Built PyArrow table with %d row(s) and %d column(s).", table.num_rows, table.num_columns)
+        passing_frame, contract_failures = apply_data_contract_gate(
+            frame,
+            source_label="pre_parquet_batch",
+        )
+
+        if contract_failures:
+            self.dead_letter_queue.extend(contract_failures)
+            self.stats.contract_rejected_records += len(contract_failures)
+            self.stats.rejected_records += len(contract_failures)
+            self.stats.valid_records -= len(contract_failures)
+
+        if passing_frame.empty:
+            raise ValueError("All rows failed Pandera data contract validation.")
+
+        table = pa.Table.from_pandas(
+            passing_frame,
+            schema=TELEMETRY_ARROW_SCHEMA,
+            preserve_index=False,
+        )
+        logger.info(
+            "Built PyArrow table with %d row(s) and %d column(s) after contract gate.",
+            table.num_rows,
+            table.num_columns,
+        )
         return table
 
     def write_partitioned_parquet(self, table: pa.Table, output_base_dir: str) -> None:

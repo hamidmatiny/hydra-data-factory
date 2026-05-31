@@ -1,0 +1,48 @@
+# Local cloud pipeline emulation — simulator + containerized ETL processor
+services:
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hydra-simulator
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          python -m src.simulator.generator \
+            --output-dir /data/telemetry \
+            --duration 30 \
+            --rate 5 \
+            --failure-rate 0.08 \
+            --vehicle-ids TORC-AV-001 TORC-AV-002 TORC-AV-003;
+          sleep 5;
+        done
+    environment:
+      PYTHONPATH: /app
+    volumes:
+      - ./output/telemetry:/data/telemetry
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  etl-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hydra-etl-processor
+    command: ["python", "-m", "src.transform.run_etl_container"]
+    environment:
+      PYTHONPATH: /app
+      INPUT_DIR: /data/telemetry
+      OUTPUT_DIR: /data/parquet
+      DLQ_DIR: /data/dead_letter
+      POLL_INTERVAL_SECONDS: "15"
+      RUN_ONCE: "false"
+    volumes:
+      - ./output/telemetry:/data/telemetry
+      - ./output/parquet:/data/parquet
+      - ./output/dead_letter:/data/dead_letter
+      - ./logs:/app/logs
+    depends_on:
+      - simulator
+    restart: unless-stopped

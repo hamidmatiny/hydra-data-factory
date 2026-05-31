@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from src.transform.transformer import TelemetryTransformer
+from src.transform.transformer import TelemetryTransformer, TransformStats
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -13,6 +13,29 @@ logger = get_logger(__name__)
 DEFAULT_INPUT_DIR = "output/telemetry"
 DEFAULT_OUTPUT_DIR = "output/parquet"
 DEFAULT_DLQ_DIR = "output/dead_letter"
+
+
+def _log_operational_summary(
+    *,
+    stats: TransformStats,
+    output_dir: str,
+    dead_letter_dir: str | None,
+) -> None:
+    """Emit a standardized operational summary block."""
+    acceptance_pct = stats.acceptance_rate * 100.0
+    logger.info("=" * 60)
+    logger.info("ETL OPERATIONAL SUMMARY")
+    logger.info("=" * 60)
+    logger.info("Input JSON batch files scanned : %d", stats.input_files)
+    logger.info("Total telemetry records ingested: %d", stats.input_records)
+    logger.info("Records compiled to Parquet    : %d", stats.parquet_rows_written)
+    logger.info("Records rejected by triage layer  : %d", stats.rejected_records)
+    logger.info("Contract gate rejections       : %d", stats.contract_rejected_records)
+    logger.info("Acceptance rate                : %.2f%%", acceptance_pct)
+    logger.info("Parquet output base directory  : %s", output_dir)
+    if dead_letter_dir:
+        logger.info("Dead-letter audit directory    : %s", dead_letter_dir)
+    logger.info("=" * 60)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -62,19 +85,11 @@ def main() -> int:
         logger.exception("ETL failed with unexpected error: %s", exc)
         return 1
 
-    acceptance_pct = stats.acceptance_rate * 100.0
-    logger.info("=" * 60)
-    logger.info("ETL OPERATIONAL SUMMARY")
-    logger.info("=" * 60)
-    logger.info("Input JSON batch files scanned : %d", stats.input_files)
-    logger.info("Total telemetry records ingested: %d", stats.input_records)
-    logger.info("Records compiled to Parquet    : %d", stats.parquet_rows_written)
-    logger.info("Records rejected by triage layer  : %d", stats.rejected_records)
-    logger.info("Acceptance rate                : %.2f%%", acceptance_pct)
-    logger.info("Parquet output base directory  : %s", args.output_dir)
-    if dead_letter_dir:
-        logger.info("Dead-letter audit directory    : %s", dead_letter_dir)
-    logger.info("=" * 60)
+    _log_operational_summary(
+        stats=stats,
+        output_dir=args.output_dir,
+        dead_letter_dir=dead_letter_dir,
+    )
 
     return 0
 
