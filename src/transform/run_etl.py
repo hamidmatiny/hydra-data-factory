@@ -5,8 +5,13 @@ from __future__ import annotations
 import argparse
 import sys
 
+from dotenv import load_dotenv
+
 from src.transform.transformer import TelemetryTransformer, TransformStats
+from src.utils.aws_config import aws_enabled, get_aws_config
 from src.utils.logger import get_logger
+
+load_dotenv()
 
 logger = get_logger(__name__)
 
@@ -32,7 +37,14 @@ def _log_operational_summary(
     logger.info("Records rejected by triage layer  : %d", stats.rejected_records)
     logger.info("Contract gate rejections       : %d", stats.contract_rejected_records)
     logger.info("Acceptance rate                : %.2f%%", acceptance_pct)
-    logger.info("Parquet output base directory  : %s", output_dir)
+    if aws_enabled():
+        aws_config = get_aws_config()
+        logger.info("AWS data lake bucket           : %s", aws_config.bucket if aws_config else "")
+        logger.info("Glue database                  : %s", aws_config.glue_database if aws_config else "")
+        logger.info("S3 invalid telemetry uploaded  : %d", stats.s3_invalid_records_uploaded)
+        logger.info("Glue analytics rows written    : %d", stats.glue_rows_written)
+    else:
+        logger.info("Parquet output base directory  : %s", output_dir)
     if dead_letter_dir:
         logger.info("Dead-letter audit directory    : %s", dead_letter_dir)
     logger.info("=" * 60)

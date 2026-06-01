@@ -15,6 +15,11 @@ from pydantic import ValidationError
 
 from config.schema_contract import apply_data_contract_gate
 from src.simulator.schemas import VehicleTelemetry
+from src.transform.aws_sink import (
+    upload_contract_violations_to_s3,
+    write_analytics_parquet_to_glue,
+)
+from src.utils.aws_config import aws_enabled, get_aws_config
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -34,6 +39,7 @@ TELEMETRY_ARROW_SCHEMA: Final[pa.Schema] = pa.schema(
         ("lidar_temp_c", pa.float64()),
         ("compute_load_pct", pa.float64()),
         ("hardware_version", pa.string()),
+        ("device_type", pa.string()),
         ("year", pa.string()),
         ("month", pa.string()),
     ]
@@ -62,6 +68,8 @@ class TransformStats:
     rejected_records: int = 0
     contract_rejected_records: int = 0
     parquet_rows_written: int = 0
+    s3_invalid_records_uploaded: int = 0
+    glue_rows_written: int = 0
 
     @property
     def acceptance_rate(self) -> float:
@@ -105,10 +113,10 @@ class TelemetryTransformer:
 
         if self._valid_rows:
             try:
-                table = self.build_arrow_table()
-                self.write_partitioned_parquet(table, output_base_dir)
+                validated_frame = self.get_validated_dataframe()
+                self.write_analytics_output(validated_frame, output_base_dir)
             except ValueError as exc:
-                logger.warning("Parquet write skipped after contract gate: %s", exc)
+                logger.warning("Analytics write skipped after contract gate: %s", exc)
         else:
             logger.warning("No valid records found; skipping Parquet write.")
 
@@ -320,19 +328,27 @@ class TelemetryTransformer:
             "lidar_temp_c": lidar_temp_c,
             "compute_load_pct": compute_load_pct,
             "hardware_version": payload["hardware_version"],
+            "device_type": TelemetryTransformer._derive_device_type(payload["vehicle_id"]),
             "year": f"{timestamp_dt.year:04d}",
             "month": f"{timestamp_dt.month:02d}",
         }
 
-    def build_arrow_table(self) -> pa.Table:
-        """
-        Convert validated rows into a strictly typed PyArrow Table via Pandas.
+    @staticmethod
+    def _derive_device_type(vehicle_id: str) -> str:
+        """Derive Hive partition key from fleet identifier (e.g. TORC-AV-001 -> TORC-AV)."""
+        if "-" not in vehicle_id:
+            return vehicle_id
+        return vehicle_id.rsplit("-", 1)[0]
 
-        Applies Pandera **Data Quality Gates** before casting; contract failures
-        are routed to the DLQ without aborting the pipeline.
+    def get_validated_dataframe(self) -> pd.DataFrame:
+        """
+        Build a contract-gated Pandas DataFrame ready for analytics materialization.
+
+        Pandera failures are appended to the DLQ; passing rows include ``device_type``
+        for AWS Hive partitioning.
         """
         if not self._valid_rows:
-            raise ValueError("Cannot build Arrow table without valid records.")
+            raise ValueError("Cannot build DataFrame without valid records.")
 
         frame = pd.DataFrame(self._valid_rows)
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
@@ -347,10 +363,22 @@ class TelemetryTransformer:
             self.stats.contract_rejected_records += len(contract_failures)
             self.stats.rejected_records += len(contract_failures)
             self.stats.valid_records -= len(contract_failures)
+            if aws_enabled():
+                uploaded = upload_contract_violations_to_s3(contract_failures)
+                self.stats.s3_invalid_records_uploaded += uploaded
 
         if passing_frame.empty:
             raise ValueError("All rows failed Pandera data contract validation.")
 
+        logger.info(
+            "Validated %d row(s) after Pandera contract gate.",
+            len(passing_frame),
+        )
+        return passing_frame
+
+    def build_arrow_table(self) -> pa.Table:
+        """Convert the validated DataFrame into a strictly typed PyArrow Table."""
+        passing_frame = self.get_validated_dataframe()
         table = pa.Table.from_pandas(
             passing_frame,
             schema=TELEMETRY_ARROW_SCHEMA,
@@ -362,6 +390,34 @@ class TelemetryTransformer:
             table.num_columns,
         )
         return table
+
+    def write_analytics_output(self, frame: pd.DataFrame, output_base_dir: str) -> None:
+        """
+        Write pristine analytics data to AWS Glue/S3 or local Hive-partitioned Parquet.
+
+        When ``DATA_LAKE_BUCKET`` and ``GLUE_DATABASE`` are configured, uses
+        ``awswrangler.s3.to_parquet`` with Glue catalog sync. Otherwise falls
+        back to local PyArrow dataset writes.
+        """
+        if aws_enabled():
+            rows_written = write_analytics_parquet_to_glue(frame)
+            self.stats.glue_rows_written = rows_written
+            self.stats.parquet_rows_written = rows_written
+            aws_config = get_aws_config()
+            logger.info(
+                "AWS analytics sink: s3://%s/%s (Glue: %s.telemetry)",
+                aws_config.bucket if aws_config else "",
+                "analytics/telemetry/",
+                aws_config.glue_database if aws_config else "",
+            )
+            return
+
+        table = pa.Table.from_pandas(
+            frame,
+            schema=TELEMETRY_ARROW_SCHEMA,
+            preserve_index=False,
+        )
+        self.write_partitioned_parquet(table, output_base_dir)
 
     def write_partitioned_parquet(self, table: pa.Table, output_base_dir: str) -> None:
         """

@@ -7,9 +7,14 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from src.transform.run_etl import _log_operational_summary
 from src.transform.transformer import TelemetryTransformer
+from src.utils.aws_config import aws_enabled, get_aws_config
 from src.utils.logger import get_logger
+
+load_dotenv()
 
 logger = get_logger(__name__)
 
@@ -71,10 +76,10 @@ def _process_new_files(
 
     if transformer._valid_rows:
         try:
-            table = transformer.build_arrow_table()
-            transformer.write_partitioned_parquet(table, str(output_dir))
+            validated_frame = transformer.get_validated_dataframe()
+            transformer.write_analytics_output(validated_frame, str(output_dir))
         except ValueError as exc:
-            logger.warning("Parquet write skipped after contract gate: %s", exc)
+            logger.warning("Analytics write skipped after contract gate: %s", exc)
 
     if transformer.dead_letter_queue:
         transformer.persist_dead_letter_queue()
@@ -112,6 +117,10 @@ def run_container_pipeline() -> int:
     logger.info("Dead-letter directory     : %s", dlq_dir.resolve())
     logger.info("Poll interval (seconds)   : %d", poll_interval)
     logger.info("Run once mode             : %s", run_once)
+    if aws_enabled():
+        aws_config = get_aws_config()
+        logger.info("AWS data lake bucket      : %s", aws_config.bucket if aws_config else "")
+        logger.info("Glue database             : %s", aws_config.glue_database if aws_config else "")
     logger.info("=" * 60)
 
     processed_files: set[str] = set()

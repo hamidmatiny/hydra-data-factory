@@ -43,6 +43,9 @@ services:
       - ./output/parquet:/data/parquet
       - ./output/dead_letter:/data/dead_letter
       - ./logs:/app/logs
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       - simulator
     restart: unless-stopped
