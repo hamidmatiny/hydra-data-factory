@@ -46,6 +46,7 @@ See also [phase_completion.md](phase_completion.md) for the consolidated enginee
 | AWS integration | boto3, AWS Data Wrangler (`awswrangler`) |
 | Infrastructure | Terraform (AWS provider ~> 5.0), Amazon S3, AWS Glue, IAM |
 | Containerization | Docker (multi-stage), Docker Compose |
+| Orchestration | Apache Airflow 2.9 (CeleryExecutor) |
 | Testing | pytest |
 | Configuration | python-dotenv (`.env`) |
 | Logging | Python `logging` — stdout + `logs/pipeline.log` |
@@ -135,8 +136,11 @@ hydra-data-factory/
 ├── tests/                         # Pytest suite (Phase 4)
 │   ├── conftest.py
 │   └── test_schema_contracts.py
+├── dags/                          # Apache Airflow DAGs
+│   └── hydra_pipeline_dag.py
 ├── Dockerfile                     # Multi-stage, non-root appuser
 ├── docker-compose.yml             # simulator + hydra-etl-processor
+├── docker-compose.airflow.yml     # local Airflow CeleryExecutor stack
 ├── requirements.txt
 ├── PHASE_1_COMPLETION.md … PHASE_6_COMPLETION.md
 ├── phase_completion.md            # Consolidated engineering log
@@ -238,6 +242,40 @@ logs/                 # pipeline.log
 ```
 
 Stop: `docker compose down`
+
+## Apache Airflow Orchestration
+
+Run the full Hydra pipeline on a daily schedule via a local Airflow CeleryExecutor stack (`apache/airflow:2.9.0`, Postgres metadata DB, Redis broker).
+
+### Start Airflow
+
+Initialize the database and admin user (first time only):
+
+```bash
+mkdir -p output/telemetry output/parquet output/dead_letter logs/airflow
+docker compose -f docker-compose.airflow.yml up airflow-init
+```
+
+Start the Airflow services:
+
+```bash
+docker compose -f docker-compose.airflow.yml up
+```
+
+Access the UI at [http://localhost:8080](http://localhost:8080) — **user:** `airflow` / **pass:** `airflow`
+
+### DAG: `hydra_av_telemetry_pipeline`
+
+| Task | Operator | Action |
+|------|----------|--------|
+| `generate_telemetry` | BashOperator | Runs mock AV telemetry simulator (30 s, 10 pps, 8% corruption) |
+| `run_etl` | BashOperator | Pydantic triage → Pandera gate → local Parquet + DLQ |
+| `validate_output` | PythonOperator | Reports rejection metrics; fails if rejection rate > 20% |
+| `sync_to_s3` | PythonOperator | Uploads Parquet to S3 + syncs Glue (skipped when `DATA_LAKE_BUCKET` unset) |
+
+Schedule: `@daily` · Retries: 2 · Retry delay: 5 minutes
+
+Trigger manually from the Airflow UI or unpause the DAG to run on schedule.
 
 ## Run Tests Inside the Container
 
