@@ -37,3 +37,18 @@ output "analytics_prefix" {
   description = "S3 prefix for Hive-partitioned Parquet analytics output."
   value       = "analytics/"
 }
+
+output "lambda_ecr_repo_url" {
+  description = "ECR repository URL for the Hydra Lambda container image."
+  value       = aws_ecr_repository.hydra_lambda.repository_url
+}
+
+output "step_function_arn" {
+  description = "ARN of the Hydra Step Functions state machine."
+  value       = aws_sfn_state_machine.hydra_pipeline.arn
+}
+
+output "dlq_queue_url" {
+  description = "SQS queue URL for Hydra pipeline failure notifications."
+  value       = aws_sqs_queue.hydra_dlq.url
+}

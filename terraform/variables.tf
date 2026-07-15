@@ -27,3 +27,15 @@ variable "glue_database_name" {
   type        = string
   default     = "hydra_analytics_db"
 }
+
+variable "glue_table_name" {
+  description = "AWS Glue table name for telemetry analytics."
+  type        = string
+  default     = "telemetry"
+}
+
+variable "enable_eventbridge_schedule" {
+  description = "When true, EventBridge triggers the Step Functions pipeline daily at 06:00 UTC."
+  type        = bool
+  default     = false
+}

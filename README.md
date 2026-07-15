@@ -12,6 +12,7 @@ End-to-end data engineering platform for autonomous-vehicle (AV) telemetry: mock
 | 4 | Complete | Pytest validation suite for contract and triage logic | [PHASE_4_COMPLETION.md](PHASE_4_COMPLETION.md) |
 | 5 | Complete | Terraform — S3 data lake, Glue catalog, IAM execution role | [PHASE_5_COMPLETION.md](PHASE_5_COMPLETION.md) |
 | 6 | Complete | AWS cloud sink — boto3 DLQ routing, Wrangler Parquet + Glue sync | [PHASE_6_COMPLETION.md](PHASE_6_COMPLETION.md) |
+| 9 | Complete | Step Functions + Lambda serverless orchestration (AWS-native alternative to Airflow) | See below |
 
 See also [phase_completion.md](phase_completion.md) for the consolidated engineering log and production run metrics.
 
@@ -46,7 +47,7 @@ See also [phase_completion.md](phase_completion.md) for the consolidated enginee
 | AWS integration | boto3, AWS Data Wrangler (`awswrangler`) |
 | Infrastructure | Terraform (AWS provider ~> 5.0), Amazon S3, AWS Glue, IAM |
 | Containerization | Docker (multi-stage), Docker Compose |
-| Orchestration | Apache Airflow 2.9 (CeleryExecutor) |
+| Orchestration | Apache Airflow 2.9 (CeleryExecutor), AWS Step Functions + Lambda |
 | Testing | pytest |
 | Configuration | python-dotenv (`.env`) |
 | Logging | Python `logging` — stdout + `logs/pipeline.log` |
@@ -129,13 +130,27 @@ hydra-data-factory/
 │   └── utils/
 │       ├── logger.py              # Unified logging
 │       └── aws_config.py          # .env-driven AWS config (Phase 6)
-├── terraform/                     # S3, Glue, IAM (Phase 5)
+├── lambda/                        # Step Functions Lambda handlers (Phase 9)
+│   ├── generate_handler.py
+│   ├── validate_handler.py
+│   ├── sync_handler.py
+│   ├── dlq_handler.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── terraform/                     # S3, Glue, IAM (Phase 5) + Lambda/SFN (Phase 9)
 │   ├── main.tf
+│   ├── ecr.tf
+│   ├── lambda.tf
+│   ├── sqs.tf
+│   ├── iam_lambda.tf
+│   ├── step_functions.tf
+│   ├── statemachine/hydra_pipeline.asl.json.tpl
 │   ├── variables.tf
 │   └── outputs.tf
-├── tests/                         # Pytest suite (Phase 4)
+├── tests/                         # Pytest suite (Phase 4 + Phase 9)
 │   ├── conftest.py
-│   └── test_schema_contracts.py
+│   ├── test_schema_contracts.py
+│   └── test_lambda_handlers.py
 ├── dags/                          # Apache Airflow DAGs
 │   └── hydra_pipeline_dag.py
 ├── Dockerfile                     # Multi-stage, non-root appuser
@@ -277,7 +292,91 @@ Schedule: `@daily` · Retries: 2 · Retry delay: 5 minutes
 
 Trigger manually from the Airflow UI or unpause the DAG to run on schedule.
 
-## Run Tests Inside the Container
+## Step Functions + Lambda Orchestration (Phase 9)
+
+Serverless AWS-native orchestration alternative to the Airflow DAG. Four Lambda functions share one container image and are chained by an AWS Step Functions state machine. Any task failure or rejection rate above 20% routes through a DLQ handler that persists failure metadata to S3 and SQS.
+
+```mermaid
+flowchart LR
+    SFN[Step Functions\nhydra-data-factory-pipeline]
+    Gen[hydra_generate]
+    Val[hydra_validate]
+    Sync[hydra_sync]
+    DLQ[hydra_dlq]
+    S3[(S3 data lakehouse)]
+    Glue[(Glue hydra_analytics_db.telemetry)]
+    SQS[(SQS hydra-data-factory-dlq)]
+
+    SFN --> Gen --> Val --> Sync
+    Gen --> S3
+    Val --> S3
+    Sync --> S3
+    Sync --> Glue
+    SFN -->|failure or high rejection| DLQ
+    DLQ --> S3
+    DLQ --> SQS
+```
+
+| Lambda | Handler | Role |
+|--------|---------|------|
+| `hydra_generate` | `generate_handler.lambda_handler` | Mock AV telemetry batch → `raw/{execution_id}/batch.json` |
+| `hydra_validate` | `validate_handler.lambda_handler` | Pydantic triage + Pandera gate → staging Parquet + rejected JSON |
+| `hydra_sync` | `sync_handler.lambda_handler` | Copy to `telemetry/dt={date}/` + Glue catalog sync |
+| `hydra_dlq` | `dlq_handler.lambda_handler` | Failure record → S3 `dead_letter/failures/` + SQS |
+
+Both orchestrators coexist intentionally: **Airflow** demonstrates scheduled batch orchestration with local MLflow experiment tracking; **Step Functions + Lambda** demonstrates the serverless AWS-native pattern targeted by Wave HQ ML Engineer II requirements. They are independent — enable only one scheduler in production to avoid duplicate writes.
+
+MLflow tracking is scoped to the Airflow path only. Lambda functions have no network route to the local Docker MLflow server and do not attempt to log runs.
+
+### Build and push the Lambda image
+
+Build from the **repository root** (the Dockerfile copies `src/` and `config/`):
+
+```bash
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account_id>.dkr.ecr.us-east-1.amazonaws.com
+
+docker build -f lambda/Dockerfile -t hydra-lambda .
+docker tag hydra-lambda:latest <lambda_ecr_repo_url>:latest
+docker push <lambda_ecr_repo_url>:latest
+```
+
+After pushing the image, apply Terraform (creates ECR repo, Lambdas, Step Functions, SQS, IAM):
+
+```bash
+cd terraform
+terraform init
+terraform apply
+```
+
+Optional daily schedule: set `enable_eventbridge_schedule = true` in Terraform variables (defaults to `false` so Airflow and EventBridge do not compete).
+
+### Trigger a manual execution
+
+```bash
+aws stepfunctions start-execution \
+  --state-machine-arn <step_function_arn> \
+  --input '{}'
+```
+
+Terraform outputs `lambda_ecr_repo_url`, `step_function_arn`, and `dlq_queue_url` after apply.
+
+## Run Tests
+
+Local Lambda handler tests (moto mocks; Python 3.11 recommended — or run inside the Lambda image):
+
+```bash
+pip install -r requirements-test.txt
+pytest tests/test_lambda_handlers.py -v
+```
+
+If `pyarrow` has no wheel for your local Python version, run tests in the built Lambda container:
+
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace --entrypoint /bin/bash hydra-lambda \
+  -c "pip install -q 'moto[s3,glue,sqs]' pytest && PYTHONPATH=/workspace:/workspace/lambda pytest tests/test_lambda_handlers.py -v"
+```
+
+Schema contract tests inside the container:
 
 ```bash
 docker compose build
