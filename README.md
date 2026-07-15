@@ -142,7 +142,7 @@ terraform init
 terraform apply
 ```
 
-Terraform creates the data lakehouse bucket (name derived from account ID, e.g. `hydra-data-lakehouse-prod-903367786893`), Glue database `hydra_analytics_db`, ECS ETL IAM role, and—when Phase 9 resources are applied—ECR, four Lambda functions, Step Functions state machine, and SQS DLQ.
+Terraform creates the data lakehouse bucket (name derived from account ID, e.g. `hydra-data-lakehouse-prod-903367786893`), Glue database `hydra_analytics_db`, and the ETL processor IAM role. Applying the Lambda/Step Functions resources additionally creates ECR, four Lambda functions, a Step Functions state machine, and an SQS DLQ.
 
 ### Step Functions + Lambda (AWS)
 
