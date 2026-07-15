@@ -1,8 +1,8 @@
 """Centralized logging configuration for the Hydra Data Factory pipeline."""
-
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Final
@@ -18,6 +18,13 @@ DEFAULT_LOG_FILE: Final[Path] = DEFAULT_LOG_DIR / "pipeline.log"
 _configured: bool = False
 
 
+def _running_in_lambda() -> bool:
+    """AWS Lambda always sets this env var; its filesystem is read-only
+    except for /tmp, so file-based logging is skipped there in favor of
+    stdout, which CloudWatch already captures."""
+    return bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+
 def setup_logger(
     name: str = APP_LOGGER_NAME,
     level: int = logging.INFO,
@@ -26,13 +33,13 @@ def setup_logger(
     """
     Configure the root application logger and return it.
 
-    Logs are emitted to stdout and to ``logs/pipeline.log`` (created if absent).
-    Child loggers obtained via :func:`get_logger` propagate to this root logger.
+    Logs are emitted to stdout always, and additionally to
+    ``logs/pipeline.log`` when running outside Lambda (created if absent).
+    Child loggers obtained via :func:`get_logger` propagate to this root
+    logger.
     """
     global _configured
-
     logger = logging.getLogger(name)
-
     if _configured and logger.handlers:
         return logger
 
@@ -46,18 +53,23 @@ def setup_logger(
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
-    target_dir = log_dir or DEFAULT_LOG_DIR
-    target_dir.mkdir(parents=True, exist_ok=True)
-    log_file = target_dir / "pipeline.log"
-
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    if not _running_in_lambda():
+        target_dir = log_dir or DEFAULT_LOG_DIR
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            log_file = target_dir / "pipeline.log"
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            logger.debug("Logger initialized; writing to %s", log_file.resolve())
+        except OSError:
+            logger.warning(
+                "Could not create file log handler (read-only filesystem?); "
+                "continuing with stdout logging only."
+            )
 
     _configured = True
-    logger.debug("Logger initialized; writing to %s", log_file.resolve())
-
     return logger
 
 
@@ -70,8 +82,6 @@ def get_logger(name: str = APP_LOGGER_NAME) -> logging.Logger:
     """
     if not _configured:
         setup_logger()
-
     if name == APP_LOGGER_NAME or name.startswith(f"{APP_LOGGER_NAME}."):
         return logging.getLogger(name)
-
     return logging.getLogger(f"{APP_LOGGER_NAME}.{name}")
