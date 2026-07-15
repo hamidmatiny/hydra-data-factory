@@ -6,16 +6,19 @@ This document records the design, implementation, and verification history of th
 
 ## Phase Summary
 
-See individual phase documents for detailed engineering logs:
+See individual development notes for detailed engineering logs:
 
 | Phase | Document |
 |-------|----------|
-| 1 | [PHASE_1_COMPLETION.md](PHASE_1_COMPLETION.md) |
-| 2 | [PHASE_2_COMPLETION.md](PHASE_2_COMPLETION.md) |
-| 3 | [PHASE_3_COMPLETION.md](PHASE_3_COMPLETION.md) |
-| 4 | [PHASE_4_COMPLETION.md](PHASE_4_COMPLETION.md) |
-| 5 | [PHASE_5_COMPLETION.md](PHASE_5_COMPLETION.md) |
-| 6 | [PHASE_6_COMPLETION.md](PHASE_6_COMPLETION.md) |
+| 1 | [phase-01-telemetry-simulator-and-schemas.md](phase-01-telemetry-simulator-and-schemas.md) |
+| 2 | [phase-02-etl-partitioned-parquet.md](phase-02-etl-partitioned-parquet.md) |
+| 3 | [phase-03-pandera-docker-compose.md](phase-03-pandera-docker-compose.md) |
+| 4 | [phase-04-pytest-schema-contracts.md](phase-04-pytest-schema-contracts.md) |
+| 5 | [phase-05-terraform-data-lakehouse.md](phase-05-terraform-data-lakehouse.md) |
+| 6 | [phase-06-aws-s3-glue-sink.md](phase-06-aws-s3-glue-sink.md) |
+| 7 | [phase-07-airflow-orchestration.md](phase-07-airflow-orchestration.md) |
+| 8 | [phase-08-mlflow-experiment-tracking.md](phase-08-mlflow-experiment-tracking.md) |
+| 9 | [phase-09-step-functions-lambda.md](phase-09-step-functions-lambda.md) |
 
 ---
 
