@@ -6,7 +6,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,7 @@ def _parse_total_processed(log_path: Path) -> int:
     return int(matches[-1]) if matches else 0
 
 
-def validate_output(**context: Any) -> None:
+def validate_output(**context: Any) -> dict[str, Any]:
     """Report DLQ metrics and fail when rejection rate exceeds the SLA threshold."""
     task_logger = context["ti"].log
 
@@ -66,6 +66,15 @@ def validate_output(**context: Any) -> None:
         rejection_rate = 0.0
     else:
         rejection_rate = total_rejected / total_processed
+
+    valid_records = max(total_processed - total_rejected, 0)
+    summary: dict[str, Any] = {
+        "total": total_processed,
+        "valid": valid_records,
+        "rejected": total_rejected,
+        "rejection_rate": rejection_rate,
+        "dlq_file": dlq_file,
+    }
 
     task_logger.info("DLQ file inspected       : %s", dlq_file or "none")
     task_logger.info("total_rejected           : %d", total_rejected)
@@ -79,13 +88,15 @@ def validate_output(**context: Any) -> None:
             f"(rejected={total_rejected}, processed={total_processed})."
         )
 
+    return summary
 
-def sync_to_s3(**context: Any) -> None:
+
+def sync_to_s3(**context: Any) -> dict[str, Any]:
     """Upload validated local Parquet to S3 and sync the Glue catalog."""
     from dotenv import load_dotenv
 
     from src.transform.aws_sink import write_analytics_parquet_to_glue
-    from src.utils.aws_config import get_aws_config
+    from src.utils.aws_config import ANALYTICS_TELEMETRY_PREFIX, GLUE_TABLE_NAME, get_aws_config
 
     task_logger = context["ti"].log
     load_dotenv(Path(PROJECT_ROOT) / ".env")
@@ -93,34 +104,138 @@ def sync_to_s3(**context: Any) -> None:
     bucket = os.environ.get("DATA_LAKE_BUCKET", "").strip()
     if not bucket:
         task_logger.info("S3 sink skipped — local mode")
-        return
+        return {
+            "s3_key": "local-mode-skipped",
+            "glue_table": "local-mode-skipped",
+            "rows_written": 0,
+            "skipped": True,
+        }
 
     aws_config = get_aws_config()
     if aws_config is None:
         task_logger.info("S3 sink skipped — local mode")
-        return
+        return {
+            "s3_key": "local-mode-skipped",
+            "glue_table": "local-mode-skipped",
+            "rows_written": 0,
+            "skipped": True,
+        }
+
+    s3_key = f"s3://{aws_config.bucket}/{ANALYTICS_TELEMETRY_PREFIX}"
+    glue_table = f"{aws_config.glue_database}.{GLUE_TABLE_NAME}"
 
     if not PARQUET_DIR.is_dir() or not any(PARQUET_DIR.rglob("*.parquet")):
         task_logger.warning("No Parquet files found under %s; nothing to sync.", PARQUET_DIR)
-        return
+        return {
+            "s3_key": s3_key,
+            "glue_table": glue_table,
+            "rows_written": 0,
+            "skipped": True,
+        }
 
     dataset = ds.dataset(str(PARQUET_DIR), format="parquet", partitioning="hive")
     frame = dataset.to_table().to_pandas()
 
     if frame.empty:
         task_logger.warning("Parquet dataset is empty; skipping S3 sync.")
-        return
+        return {
+            "s3_key": s3_key,
+            "glue_table": glue_table,
+            "rows_written": 0,
+            "skipped": True,
+        }
 
     if "device_type" not in frame.columns and "vehicle_id" in frame.columns:
         frame["device_type"] = frame["vehicle_id"].astype(str).str.rsplit("-", n=1).str[0]
 
     rows_written = write_analytics_parquet_to_glue(frame, config=aws_config)
     task_logger.info(
-        "S3 sync complete: %d row(s) → s3://%s/analytics/telemetry/ (Glue: %s.telemetry)",
+        "S3 sync complete: %d row(s) → %s (Glue: %s)",
         rows_written,
-        aws_config.bucket,
-        aws_config.glue_database,
+        s3_key,
+        glue_table,
     )
+    return {
+        "s3_key": s3_key,
+        "glue_table": glue_table,
+        "rows_written": rows_written,
+        "skipped": False,
+    }
+
+
+def log_run_to_mlflow(**context: Any) -> None:
+    """Log pipeline run metrics to MLflow; failures are non-fatal."""
+    ti = context["ti"]
+    task_logger = ti.log
+
+    try:
+        import mlflow
+
+        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment("hydra_av_telemetry_pipeline")
+
+        validation = ti.xcom_pull(task_ids="validate_output") or {}
+        sync_result = ti.xcom_pull(task_ids="sync_to_s3") or {}
+        generate_xcom = ti.xcom_pull(task_ids="generate_telemetry")
+        run_etl_xcom = ti.xcom_pull(task_ids="run_etl")
+
+        dag_run = context["dag_run"]
+        start_date = dag_run.start_date
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+        pipeline_duration_seconds = (datetime.now(timezone.utc) - start_date).total_seconds()
+
+        data_interval_start = context.get("data_interval_start")
+        data_interval_end = context.get("data_interval_end")
+
+        total_records = int(validation.get("total", 0))
+        rejected_records = int(validation.get("rejected", 0))
+        valid_records = int(validation.get("valid", max(total_records - rejected_records, 0)))
+        rejection_rate = float(validation.get("rejection_rate", 0.0))
+
+        s3_key = str(sync_result.get("s3_key", "unknown"))
+        glue_table = str(sync_result.get("glue_table", "unknown"))
+        execution_date = context.get("execution_date") or dag_run.execution_date
+
+        with mlflow.start_run(run_name=f"pipeline-{dag_run.run_id}"):
+            mlflow.log_params(
+                {
+                    "data_interval_start": str(data_interval_start),
+                    "data_interval_end": str(data_interval_end),
+                    "rejection_rate_threshold": REJECTION_RATE_THRESHOLD,
+                    "generate_telemetry_xcom": str(generate_xcom),
+                    "run_etl_xcom": str(run_etl_xcom),
+                }
+            )
+            mlflow.log_metrics(
+                {
+                    "total_records": total_records,
+                    "valid_records": valid_records,
+                    "rejected_records": rejected_records,
+                    "rejection_rate": rejection_rate,
+                    "pipeline_duration_seconds": pipeline_duration_seconds,
+                }
+            )
+            mlflow.set_tags(
+                {
+                    "dag_run_id": dag_run.run_id,
+                    "execution_date": str(execution_date),
+                    "s3_key": s3_key,
+                    "glue_table": glue_table,
+                }
+            )
+
+        task_logger.info(
+            "MLflow run logged: total=%d valid=%d rejected=%d rate=%.4f uri=%s",
+            total_records,
+            valid_records,
+            rejected_records,
+            rejection_rate,
+            tracking_uri,
+        )
+    except Exception as exc:
+        task_logger.warning("MLflow tracking failed (non-fatal): %s", exc)
 
 
 default_args: dict[str, Any] = {
@@ -130,7 +245,7 @@ default_args: dict[str, Any] = {
 
 with DAG(
     dag_id="hydra_av_telemetry_pipeline",
-    description="Hydra AV telemetry: generate → ETL → validate → S3/Glue sync",
+    description="Hydra AV telemetry: generate → ETL → validate → S3/Glue sync → MLflow",
     schedule_interval="@daily",
     start_date=datetime(2025, 1, 1),
     catchup=False,
@@ -174,4 +289,10 @@ with DAG(
         python_callable=sync_to_s3,
     )
 
-    generate_telemetry >> run_etl >> validate_output_task >> sync_to_s3_task
+    log_run_to_mlflow_task = PythonOperator(
+        task_id="log_run_to_mlflow",
+        python_callable=log_run_to_mlflow,
+        trigger_rule="all_done",
+    )
+
+    generate_telemetry >> run_etl >> validate_output_task >> sync_to_s3_task >> log_run_to_mlflow_task

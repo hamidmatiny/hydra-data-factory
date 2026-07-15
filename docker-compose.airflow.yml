@@ -18,7 +18,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
     PYTHONPATH: /opt/airflow/project
-    _PIP_ADDITIONAL_REQUIREMENTS: "pydantic>=2.0.0 pandas>=2.0.0 pyarrow>=14.0.0 pandera>=0.20.0 boto3>=1.34.0 awswrangler>=3.9.0 python-dotenv>=1.0.0"
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    _PIP_ADDITIONAL_REQUIREMENTS: "pydantic>=2.0.0 pandas>=2.0.0 pyarrow>=14.0.0 pandera>=0.20.0 boto3>=1.34.0 awswrangler>=3.9.0 python-dotenv>=1.0.0 mlflow>=2.14.0"
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/project/src
@@ -163,5 +164,27 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  mlflow:
+    build:
+      context: ./mlflow
+    container_name: hydra-mlflow
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow-data:/mlflow/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   airflow-postgres-data:
+  mlflow-data:
