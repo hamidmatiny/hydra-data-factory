@@ -62,15 +62,40 @@ MLflow tracking applies only to the Airflow DAG (`log_run_to_mlflow` task). Lamb
 
 ## Tech stack
 
-- **Python 3.11** — simulator, ETL, Lambda handlers, Airflow tasks
-- **Pydantic v2 + Pandera** — record-level triage and DataFrame contract gate
-- **Pandas, PyArrow, awswrangler** — columnar transforms and S3/Glue Parquet I/O
-- **boto3** — S3, SQS, Glue API calls
-- **Docker / Docker Compose** — ETL container, Airflow CeleryExecutor stack, MLflow server, Lambda image
-- **Apache Airflow 2.9** (CeleryExecutor) — scheduled batch orchestration
-- **MLflow 2.14** — experiment tracking on the Airflow path
-- **Terraform (AWS ~> 5.0)** — S3, Glue, IAM, ECR, Lambda, Step Functions, SQS
-- **pytest + moto** — schema contract and Lambda handler tests
+### Cloud infrastructure & IaC
+
+- **AWS S3** — data lakehouse bucket (`raw/`, `staging/`, `analytics/telemetry/`, dead-letter prefixes)
+- **AWS Glue** (Data Catalog) — `hydra_analytics_db` database and `telemetry` table metadata
+- **AWS Lambda** — four container-image functions (generate, validate, sync, DLQ)
+- **AWS Step Functions** — `hydra-data-factory-pipeline` state machine
+- **AWS ECR** — shared Lambda container image repository
+- **AWS SQS** — pipeline failure dead-letter queue
+- **AWS CloudWatch Logs** — Lambda and Step Functions execution logging (14-day retention)
+- **AWS IAM** — least-scope roles for ETL processor, Lambda, and Step Functions
+- **Terraform** — `hashicorp/aws` provider `~> 5.0` (lock file: `5.100.0`)
+
+### Orchestration & MLOps
+
+- **Apache Airflow `2.9.0`** — CeleryExecutor (Postgres metadata DB, Redis broker); DAG `hydra_av_telemetry_pipeline`
+- **MLflow `2.14.1`** — experiment tracking server on the Airflow path (`mlflow>=2.14.0` in Airflow worker deps)
+
+### Data processing
+
+- **Python `3.11`** — ETL core, Lambda handlers, Airflow tasks, MLflow server image
+- **Pydantic** `>=2.0.0,<3.0.0` — record-level triage and schema validation
+- **Pandera** `>=0.20.0,<0.23.0` — DataFrame contract gate
+- **pandas** `>=2.0.0,<3.0.0` — columnar transforms
+- **PyArrow** `>=14.0.0,<20.0.0` — Parquet read/write
+- **awswrangler** `>=3.9.0,<4.0.0` — S3 Parquet I/O and Glue catalog sync
+- **boto3** `>=1.34.0,<2.0.0` — S3, SQS, and Glue API calls
+- **python-dotenv** `>=1.0.0,<2.0.0` — environment-driven AWS configuration
+
+### Containerization & testing
+
+- **Docker** — multi-stage ETL image (`python:3.11-slim`), Lambda image (`public.ecr.aws/lambda/python:3.11`), MLflow image
+- **Docker Compose** — local ETL stack (`docker-compose.yml`) and Airflow + MLflow stack (`docker-compose.airflow.yml`)
+- **pytest** `>=8.0.0,<9.0.0` — schema contract and Lambda handler tests
+- **moto** `[s3,glue,sqs]>=5.0.0,<6.0.0` — mocked AWS services in unit tests
 
 ## Getting started
 
@@ -192,4 +217,4 @@ Additional columns written to analytics Parquet include `device_type`, sensor te
 
 ## License
 
-Portfolio / educational project.
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
